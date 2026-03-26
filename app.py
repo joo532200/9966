@@ -66,6 +66,7 @@ def load_data(df: pd.DataFrame) -> pd.DataFrame:
         "平五波色": "平五波",
         "平六波色": "平六波",
         "特码波色": "特码波",
+        "特波": "特码波",
     }
     df = df.rename(columns=rename_map)
 
