@@ -9,6 +9,7 @@ from typing import List, Tuple, Dict
 import numpy as np
 import pandas as pd
 import streamlit as st
+from sklearn.preprocessing import LabelEncoder
 from xgboost import XGBClassifier
 
 st.set_page_config(page_title="Top-10号码预测", layout="wide")
@@ -69,22 +70,23 @@ def standardize_columns(df: pd.DataFrame) -> pd.DataFrame:
 
     # 删除重复列，保留第一次出现的
     df = df.loc[:, ~df.columns.duplicated()]
-
     return df
 
 
 def remove_bad_rows(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
 
-    # 删除混入的数据表头行
-    bad_markers = {"expect", "openTime", "平一", "平二", "平三", "平四", "平五", "平六", "特码", "特码波", "特码生肖"}
+    bad_markers = {
+        "expect", "openTime", "平一", "平二", "平三", "平四", "平五", "平六", "特码",
+        "平一波", "平二波", "平三波", "平四波", "平五波", "平六波", "特码波",
+        "平一生肖", "平二生肖", "平三生肖", "平四生肖", "平五生肖", "平六生肖", "特码生肖"
+    }
+
     mask_bad = df.apply(
         lambda row: any(str(v).strip() in bad_markers for v in row.values),
         axis=1
     )
-
-    df = df.loc[~mask_bad].copy()
-    df = df.reset_index(drop=True)
+    df = df.loc[~mask_bad].copy().reset_index(drop=True)
     return df
 
 
@@ -105,19 +107,13 @@ def load_data(df: pd.DataFrame) -> pd.DataFrame:
         df[c] = pd.to_numeric(df[c], errors="coerce")
 
     for c in WAVE_COLS:
-        df[c] = df[c].astype(str).str.strip().str.replace("色", "", regex=False).str.replace("\ufeff", "", regex=False)
-
-    for c in ZODIAC_COLS:
-        df[c] = df[c].astype(str).str.strip().str.replace("\ufeff", "", regex=False)
-
-    # 再次剔除异常行
-    df = df[
-        df["expect"].notna() &
-        df["openTime"].notna()
-    ].copy()
-
-    for c in WAVE_COLS:
-        df = df[df[c].isin(ALL_WAVES)].copy()
+        df[c] = (
+            df[c]
+            .astype(str)
+            .str.strip()
+            .str.replace("色", "", regex=False)
+            .str.replace("\ufeff", "", regex=False)
+        )
 
     zodiac_map = {
         "龍": "龙",
@@ -126,11 +122,28 @@ def load_data(df: pd.DataFrame) -> pd.DataFrame:
         "豬": "猪",
     }
     for c in ZODIAC_COLS:
-        df[c] = df[c].replace(zodiac_map)
+        df[c] = (
+            df[c]
+            .astype(str)
+            .str.strip()
+            .str.replace("\ufeff", "", regex=False)
+            .replace(zodiac_map)
+        )
+
+    # 丢掉关键列无效的行
+    df = df[
+        df["expect"].notna() &
+        df["openTime"].notna()
+    ].copy()
+
+    for c in WAVE_COLS:
+        df = df[df[c].isin(ALL_WAVES)].copy()
+
+    for c in ZODIAC_COLS:
         df = df[df[c].isin(ALL_ZODIACS)].copy()
 
     if df.empty:
-        raise ValueError("清洗后没有有效数据，请检查 Excel 是否含有重复表头或异常行。")
+        raise ValueError("清洗后没有有效数据，请检查 Excel 是否混入表头行或异常值。")
 
     if df[["expect", "openTime"] + NUM_COLS].isna().any().any():
         raise ValueError("期号 / 时间 / 号码列存在空值或无法解析的值")
@@ -149,9 +162,11 @@ def build_row_features(history_df: pd.DataFrame) -> Dict[str, float]:
     all_wave_matrix = history_df[WAVE_COLS].values.tolist()
     all_zodiac_matrix = history_df[ZODIAC_COLS].values.tolist()
 
+    # 1. 特码 lag
     for lag in [1, 2, 3, 5, 10]:
         feats[f"tm_lag_{lag}"] = float(tm_series[-lag]) if len(tm_series) >= lag else -1.0
 
+    # 2. 特码 rolling 统计
     for w in [5, 10, 20]:
         vals = tm_series[-w:]
         if len(vals) > 0:
@@ -169,6 +184,7 @@ def build_row_features(history_df: pd.DataFrame) -> Dict[str, float]:
             feats[f"tm_odd_ratio_{w}"] = -1.0
             feats[f"tm_big_ratio_{w}"] = -1.0
 
+    # 3. 最近几期整期统计
     for lag in [1, 2, 3, 5]:
         if len(history_df) >= lag:
             row = history_df.iloc[-lag]
@@ -183,6 +199,7 @@ def build_row_features(history_df: pd.DataFrame) -> Dict[str, float]:
             feats[f"draw_odd_ratio_lag_{lag}"] = -1.0
             feats[f"draw_big_ratio_lag_{lag}"] = -1.0
 
+    # 4. 号码频率与遗漏
     for num in range(1, 50):
         for w in [5, 10, 20]:
             vals = tm_series[-w:]
@@ -210,6 +227,7 @@ def build_row_features(history_df: pd.DataFrame) -> Dict[str, float]:
                 break
         feats[f"all_omit_num_{num}"] = float(len(all_num_matrix) - 1 - last_all_idx) if last_all_idx is not None else float(len(all_num_matrix))
 
+    # 5. 波色分布
     for w in [5, 10, 20]:
         recent_rows = all_wave_matrix[-w:]
         total = len(recent_rows) * 7
@@ -221,6 +239,7 @@ def build_row_features(history_df: pd.DataFrame) -> Dict[str, float]:
         for wave in ALL_WAVES:
             feats[f"tm_wave_ratio_{wave}_w{w}"] = float(np.mean([v == wave for v in recent_tm])) if len(recent_tm) > 0 else 0.0
 
+    # 6. 生肖分布
     for w in [5, 10, 20]:
         recent_rows = all_zodiac_matrix[-w:]
         total = len(recent_rows) * 7
@@ -232,6 +251,7 @@ def build_row_features(history_df: pd.DataFrame) -> Dict[str, float]:
         for z in ALL_ZODIACS:
             feats[f"tm_zodiac_ratio_{z}_w{w}"] = float(np.mean([v == z for v in recent_tm])) if len(recent_tm) > 0 else 0.0
 
+    # 7. 时间特征
     last_time = history_df.iloc[-1]["openTime"]
     feats["last_weekday"] = float(last_time.weekday())
     feats["last_day"] = float(last_time.day)
@@ -252,7 +272,7 @@ def build_supervised_table(df: pd.DataFrame, min_history: int = 30) -> Tuple[pd.
 
         feat = build_row_features(history)
         rows.append(feat)
-        targets.append(int(current["特码"]) - 1)
+        targets.append(int(current["特码"]))  # 保持真实号码，不减1
         expects.append(int(current["expect"]))
         open_times.append(current["openTime"])
 
@@ -267,10 +287,13 @@ def get_feature_columns(X: pd.DataFrame) -> List[str]:
     return [c for c in X.columns if c not in ["expect", "openTime"]]
 
 
-def train_xgb(X_train: pd.DataFrame, y_train: pd.Series) -> XGBClassifier:
+def train_xgb(X_train: pd.DataFrame, y_train_raw: pd.Series):
+    le = LabelEncoder()
+    y_train = le.fit_transform(y_train_raw)
+
     model = XGBClassifier(
         objective="multi:softprob",
-        num_class=49,
+        num_class=len(le.classes_),
         n_estimators=220,
         max_depth=4,
         learning_rate=0.05,
@@ -285,7 +308,7 @@ def train_xgb(X_train: pd.DataFrame, y_train: pd.Series) -> XGBClassifier:
         n_jobs=4,
     )
     model.fit(X_train, y_train)
-    return model
+    return model, le
 
 
 def walk_forward_backtest(X: pd.DataFrame, y: pd.Series, train_start_size: int = 60):
@@ -306,14 +329,15 @@ def walk_forward_backtest(X: pd.DataFrame, y: pd.Series, train_start_size: int =
         X_test = X.iloc[[i]][feat_cols]
         y_true = int(y.iloc[i])
 
-        model = train_xgb(X_train, y_train)
+        model, le = train_xgb(X_train, y_train)
         proba = model.predict_proba(X_test)[0]
         rank_idx = np.argsort(proba)[::-1]
+        pred_labels = le.inverse_transform(rank_idx)
 
-        top1 = rank_idx[:1] + 1
-        top5 = rank_idx[:5] + 1
-        top10 = rank_idx[:10] + 1
-        true_num = y_true + 1
+        top1 = pred_labels[:1]
+        top5 = pred_labels[:5]
+        top10 = pred_labels[:10]
+        true_num = y_true
 
         top1_hit = int(true_num in top1)
         top5_hit = int(true_num in top5)
@@ -328,8 +352,8 @@ def walk_forward_backtest(X: pd.DataFrame, y: pd.Series, train_start_size: int =
             "expect": int(X.iloc[i]["expect"]),
             "true_num": f"{true_num:02d}",
             "top1_pred": f"{int(top1[0]):02d}",
-            "top5_pred": ",".join(f"{x:02d}" for x in top5),
-            "top10_pred": ",".join(f"{x:02d}" for x in top10),
+            "top5_pred": ",".join(f"{int(x):02d}" for x in top5),
+            "top10_pred": ",".join(f"{int(x):02d}" for x in top10),
             "top1_hit": top1_hit,
             "top5_hit": top5_hit,
             "top10_hit": top10_hit,
@@ -349,20 +373,21 @@ def predict_next_top10(df: pd.DataFrame, min_history: int = 30):
     X, y = build_supervised_table(df, min_history=min_history)
     feat_cols = get_feature_columns(X)
 
-    model = train_xgb(X[feat_cols], y)
+    model, le = train_xgb(X[feat_cols], y)
 
     next_feat = build_row_features(df.copy())
     X_next = pd.DataFrame([next_feat])[feat_cols]
 
     proba = model.predict_proba(X_next)[0]
     rank_idx = np.argsort(proba)[::-1]
+    pred_labels = le.inverse_transform(rank_idx)
 
     result = pd.DataFrame({
-        "号码": rank_idx + 1,
+        "号码": pred_labels,
         "概率": proba[rank_idx]
     }).head(10).reset_index(drop=True)
 
-    result["号码"] = result["号码"].apply(lambda x: f"{x:02d}")
+    result["号码"] = result["号码"].apply(lambda x: f"{int(x):02d}")
     return result
 
 
@@ -375,7 +400,7 @@ def to_excel_bytes(top10_df: pd.DataFrame, detail_df: pd.DataFrame) -> bytes:
 
 
 st.title("上传 Excel → 自动预测下一期 Top-10 号码")
-st.caption("自动清理空格、兼容波色字段，并过滤异常表头行。")
+st.caption("自动清理空格、兼容波色字段、修复类别编码问题。")
 
 with st.expander("支持的表头写法", expanded=False):
     st.write("expect, openTime, 平一, 平二, 平三, 平四, 平五, 平六, 特码")
