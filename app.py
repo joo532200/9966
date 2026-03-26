@@ -30,8 +30,16 @@ def normalize_wave(x: str) -> str:
 
 def normalize_zodiac(x: str) -> str:
     x = str(x).strip()
-    mapping = {"龍": "龙", "馬": "马", "雞": "鸡", "豬": "猪"}
-    return mapping.get(x, x)
+    mapping = {
+        "龍": "龙",
+        "馬": "马",
+        "雞": "鸡",
+        "豬": "猪",
+    }
+    x = mapping.get(x, x)
+    if x not in ALL_ZODIACS:
+        raise ValueError(f"未知生肖: {x}")
+    return x
 
 
 def read_uploaded_file(uploaded_file) -> pd.DataFrame:
@@ -44,12 +52,28 @@ def read_uploaded_file(uploaded_file) -> pd.DataFrame:
 
 
 def load_data(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+
+    # 1) 清理列名前后空格
+    df.columns = [str(c).strip() for c in df.columns]
+
+    # 2) 兼容“波色”列名
+    rename_map = {
+        "平一波色": "平一波",
+        "平二波色": "平二波",
+        "平三波色": "平三波",
+        "平四波色": "平四波",
+        "平五波色": "平五波",
+        "平六波色": "平六波",
+        "特码波色": "特码波",
+    }
+    df = df.rename(columns=rename_map)
+
     required_cols = ["expect", "openTime"] + NUM_COLS + WAVE_COLS + ZODIAC_COLS
     missing = [c for c in required_cols if c not in df.columns]
     if missing:
         raise ValueError(f"缺少必要列: {missing}")
 
-    df = df.copy()
     df["expect"] = pd.to_numeric(df["expect"], errors="coerce")
     df["openTime"] = pd.to_datetime(df["openTime"], errors="coerce")
 
@@ -79,9 +103,11 @@ def build_row_features(history_df: pd.DataFrame) -> Dict[str, float]:
     all_wave_matrix = history_df[WAVE_COLS].values.tolist()
     all_zodiac_matrix = history_df[ZODIAC_COLS].values.tolist()
 
+    # 1. 特码 lag
     for lag in [1, 2, 3, 5, 10]:
         feats[f"tm_lag_{lag}"] = float(tm_series[-lag]) if len(tm_series) >= lag else -1.0
 
+    # 2. 特码 rolling 统计
     for w in [5, 10, 20]:
         vals = tm_series[-w:]
         if len(vals) > 0:
@@ -99,6 +125,7 @@ def build_row_features(history_df: pd.DataFrame) -> Dict[str, float]:
             feats[f"tm_odd_ratio_{w}"] = -1.0
             feats[f"tm_big_ratio_{w}"] = -1.0
 
+    # 3. 最近几期整期统计
     for lag in [1, 2, 3, 5]:
         if len(history_df) >= lag:
             row = history_df.iloc[-lag]
@@ -113,11 +140,14 @@ def build_row_features(history_df: pd.DataFrame) -> Dict[str, float]:
             feats[f"draw_odd_ratio_lag_{lag}"] = -1.0
             feats[f"draw_big_ratio_lag_{lag}"] = -1.0
 
+    # 4. 号码频率与遗漏
     for num in range(1, 50):
+        # 特码频率
         for w in [5, 10, 20]:
             vals = tm_series[-w:]
             feats[f"tm_freq_num_{num}_w{w}"] = float(np.mean([v == num for v in vals])) if len(vals) > 0 else 0.0
 
+        # 全位置频率
         for w in [5, 10, 20]:
             recent_rows = all_num_matrix[-w:]
             if len(recent_rows) == 0:
@@ -126,20 +156,27 @@ def build_row_features(history_df: pd.DataFrame) -> Dict[str, float]:
                 cnt = sum(num in row for row in recent_rows)
                 feats[f"all_freq_num_{num}_w{w}"] = float(cnt / len(recent_rows))
 
+        # 特码遗漏
         last_tm_idx = None
         for i in range(len(tm_series) - 1, -1, -1):
             if tm_series[i] == num:
                 last_tm_idx = i
                 break
-        feats[f"tm_omit_num_{num}"] = float(len(tm_series) - 1 - last_tm_idx) if last_tm_idx is not None else float(len(tm_series))
+        feats[f"tm_omit_num_{num}"] = (
+            float(len(tm_series) - 1 - last_tm_idx) if last_tm_idx is not None else float(len(tm_series))
+        )
 
+        # 全位置遗漏
         last_all_idx = None
         for i in range(len(all_num_matrix) - 1, -1, -1):
             if num in all_num_matrix[i]:
                 last_all_idx = i
                 break
-        feats[f"all_omit_num_{num}"] = float(len(all_num_matrix) - 1 - last_all_idx) if last_all_idx is not None else float(len(all_num_matrix))
+        feats[f"all_omit_num_{num}"] = (
+            float(len(all_num_matrix) - 1 - last_all_idx) if last_all_idx is not None else float(len(all_num_matrix))
+        )
 
+    # 5. 波色分布
     for w in [5, 10, 20]:
         recent_rows = all_wave_matrix[-w:]
         total = len(recent_rows) * 7
@@ -149,8 +186,11 @@ def build_row_features(history_df: pd.DataFrame) -> Dict[str, float]:
 
         recent_tm = history_df["特码波"].tolist()[-w:]
         for wave in ALL_WAVES:
-            feats[f"tm_wave_ratio_{wave}_w{w}"] = float(np.mean([v == wave for v in recent_tm])) if len(recent_tm) > 0 else 0.0
+            feats[f"tm_wave_ratio_{wave}_w{w}"] = (
+                float(np.mean([v == wave for v in recent_tm])) if len(recent_tm) > 0 else 0.0
+            )
 
+    # 6. 生肖分布
     for w in [5, 10, 20]:
         recent_rows = all_zodiac_matrix[-w:]
         total = len(recent_rows) * 7
@@ -160,8 +200,11 @@ def build_row_features(history_df: pd.DataFrame) -> Dict[str, float]:
 
         recent_tm = history_df["特码生肖"].tolist()[-w:]
         for z in ALL_ZODIACS:
-            feats[f"tm_zodiac_ratio_{z}_w{w}"] = float(np.mean([v == z for v in recent_tm])) if len(recent_tm) > 0 else 0.0
+            feats[f"tm_zodiac_ratio_{z}_w{w}"] = (
+                float(np.mean([v == z for v in recent_tm])) if len(recent_tm) > 0 else 0.0
+            )
 
+    # 7. 时间特征
     last_time = history_df.iloc[-1]["openTime"]
     feats["last_weekday"] = float(last_time.weekday())
     feats["last_day"] = float(last_time.day)
@@ -182,7 +225,7 @@ def build_supervised_table(df: pd.DataFrame, min_history: int = 30) -> Tuple[pd.
 
         feat = build_row_features(history)
         rows.append(feat)
-        targets.append(int(current["特码"]) - 1)
+        targets.append(int(current["特码"]) - 1)  # 0~48
         expects.append(int(current["expect"]))
         open_times.append(current["openTime"])
 
@@ -282,6 +325,7 @@ def walk_forward_backtest(
 def predict_next_top10(df: pd.DataFrame, min_history: int = 30):
     X, y = build_supervised_table(df, min_history=min_history)
     feat_cols = get_feature_columns(X)
+
     model = train_xgb(X[feat_cols], y)
 
     next_feat = build_row_features(df.copy())
@@ -308,11 +352,11 @@ def to_excel_bytes(top10_df: pd.DataFrame, detail_df: pd.DataFrame) -> bytes:
 
 
 st.title("上传 Excel → 自动预测下一期 Top-10 号码")
-st.caption("上传历史数据后，自动做 walk-forward 回测，并给出下一期 Top-10 候选号码。")
+st.caption("自动清理列名空格，兼容‘波’和‘波色’字段。")
 
-with st.expander("Excel / CSV 必要列名", expanded=False):
+with st.expander("支持的表头写法", expanded=False):
     st.write("expect, openTime, 平一, 平二, 平三, 平四, 平五, 平六, 特码")
-    st.write("平一波, 平二波, 平三波, 平四波, 平五波, 平六波, 特码波")
+    st.write("平一波 / 平一波色 都可以，其余同理")
     st.write("平一生肖, 平二生肖, 平三生肖, 平四生肖, 平五生肖, 平六生肖, 特码生肖")
 
 uploaded = st.file_uploader("上传 Excel 或 CSV 文件", type=["xlsx", "csv"])
